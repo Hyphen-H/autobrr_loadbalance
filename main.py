@@ -45,6 +45,7 @@ SUPPORTED_SORT_KEYS = {
     'active_downloads': '活跃下载数'
 }
 DEFAULT_PRIMARY_SORT_KEY = 'upload_speed'
+UPLOAD_SPEED_SORT_ZERO_THRESHOLD_KIB = 200.0
 
 # 创建一个简单的logger，避免在初始化之前输出日志
 logger = logging.getLogger(__name__)
@@ -750,14 +751,20 @@ class QBittorrentLoadBalancer:
         primary_sort_key = self.config.get('primary_sort_key', DEFAULT_PRIMARY_SORT_KEY)
         
         if primary_sort_key == 'upload_speed':
-            return instance.upload_speed
+            return self._get_upload_speed_sort_value(instance)
         elif primary_sort_key == 'download_speed':
             return instance.download_speed
         elif primary_sort_key == 'active_downloads':
             return float(instance.active_downloads)
         else:
             # 默认使用上传速度
-            return instance.upload_speed
+            return self._get_upload_speed_sort_value(instance)
+
+    def _get_upload_speed_sort_value(self, instance: InstanceInfo) -> float:
+        """获取上传速度排序值，低速上传视为空闲。"""
+        if instance.upload_speed < UPLOAD_SPEED_SORT_ZERO_THRESHOLD_KIB:
+            return 0.0
+        return instance.upload_speed
         
     def _select_best_instance(self) -> Optional[InstanceInfo]:
         """选择最佳的实例来分配新任务"""
