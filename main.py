@@ -39,12 +39,14 @@ MAX_RECONNECT_ATTEMPTS = 1
 
 # 种子汇报相关常量
 ANNOUNCE_WINDOW_TOLERANCE = 5
+WAITING_DOWNLOAD_STATES = {'stalledDL', 'queuedDL', 'metaDL'}
 
 # 支持的排序键（所有均为小值优先）
 SUPPORTED_SORT_KEYS = {
     'upload_speed': '上传速度',
     'download_speed': '下载速度',
-    'active_downloads': '活跃下载数'
+    'active_downloads': '活跃下载数',
+    'total_downloads': '全部下载数'
 }
 DEFAULT_PRIMARY_SORT_KEY = 'upload_speed'
 UPLOAD_SPEED_SORT_ZERO_THRESHOLD_KIB = 500.0
@@ -142,6 +144,7 @@ class InstanceInfo:
     upload_speed: float = 0.0  # KB/s
     download_speed: float = 0.0  # KB/s
     active_downloads: int = 0
+    waiting_downloads_count: int = 0
     free_space: int = 0  # bytes
     new_tasks_count: int = 0  # 新分配的任务数
     total_added_tasks_count: int = 0  # 已添加的总任务计数
@@ -490,6 +493,9 @@ class QBittorrentLoadBalancer:
         # 从torrents信息计算活跃下载数
         all_torrents = maindata.get('torrents', {}).values()
         instance.active_downloads = len([t for t in all_torrents if t.state == 'downloading'])
+        instance.waiting_downloads_count = len([
+            t for t in all_torrents if t.state in WAITING_DOWNLOAD_STATES
+        ])
         
         instance.last_update = datetime.now()
         instance.success_metrics_count += 1  # 成功获取统计信息，计数器加1
@@ -502,6 +508,7 @@ class QBittorrentLoadBalancer:
                    f"上传={_format_speed_rate(instance.upload_speed)}，"
                    f"下载={_format_speed_rate(instance.download_speed)}，"
                    f"活跃下载={instance.active_downloads}，"
+                   f"等待下载={instance.waiting_downloads_count}，"
                    f"空间={instance.free_space/BYTES_TO_GB:.1f}/{instance.reserved_space/BYTES_TO_GB:.1f}GB，"
                    f"更新={instance.success_metrics_count}，"
                    f"历史任务={instance.total_added_tasks_count}")
@@ -766,6 +773,8 @@ class QBittorrentLoadBalancer:
             return instance.download_speed
         elif primary_sort_key == 'active_downloads':
             return float(instance.active_downloads)
+        elif primary_sort_key == 'total_downloads':
+            return instance.active_downloads + 0.5 * instance.waiting_downloads_count
         else:
             # 默认使用上传速度
             return self._get_upload_speed_sort_value(instance)
