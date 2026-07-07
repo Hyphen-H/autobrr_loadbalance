@@ -196,5 +196,33 @@ class InstanceMetricsLoggingTest(unittest.TestCase):
         self.assertEqual(3, instance.waiting_downloads_count)
 
 
+class StatusUpdateTest(unittest.TestCase):
+    class FakeClient:
+        def sync_maindata(self):
+            return {
+                "server_state": {
+                    "up_info_speed": 0,
+                    "dl_info_speed": 0,
+                    "free_space_on_disk": 0,
+                },
+                "torrents": {},
+            }
+
+    def test_single_instance_update_refreshes_metrics_from_maindata(self):
+        balancer = main.QBittorrentLoadBalancer.__new__(main.QBittorrentLoadBalancer)
+        balancer.config = {}
+        instance = main.InstanceInfo(
+            name="test",
+            url="http://example.invalid",
+            username="user",
+            password="pass",
+            client=self.FakeClient(),
+        )
+
+        balancer._update_single_instance(instance)
+
+        self.assertEqual(1, instance.success_metrics_count)
+
+
 if __name__ == "__main__":
     unittest.main()

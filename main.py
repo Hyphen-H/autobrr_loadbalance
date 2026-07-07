@@ -9,9 +9,8 @@ import os
 import time
 import threading
 import logging
-import csv
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 
@@ -25,6 +24,7 @@ DEFAULT_CONFIG_FILE = "config.json"
 # 时间间隔常量（秒）
 DEFAULT_SLEEP_TIME = 1
 TASK_PROCESSOR_SLEEP = 1
+STATUS_REFRESH_INTERVAL = 6
 ERROR_RETRY_SLEEP = 5
 RECONNECT_INTERVAL = 180
 CONNECTION_TIMEOUT = 10
@@ -37,8 +37,6 @@ BYTES_TO_GB = 1024 ** 3
 BYTES_TO_TB = 1024 ** 4
 MAX_RECONNECT_ATTEMPTS = 1
 
-# 种子汇报相关常量
-ANNOUNCE_WINDOW_TOLERANCE = 5
 WAITING_DOWNLOAD_STATES = {'stalledDL', 'queuedDL', 'metaDL'}
 
 # 支持的排序键（所有均为小值优先）
@@ -178,7 +176,6 @@ class QBittorrentLoadBalancer:
         self.pending_torrents_lock = threading.Lock()
         self.instances_lock = threading.Lock()
         self.status_refresh_event = threading.Event()
-        self.announce_retry_counts = {} # 用于跟踪每个种子的汇报重试次数
         
         # 重新配置日志（支持文件输出）
         self._setup_logging()
@@ -224,32 +221,7 @@ class QBittorrentLoadBalancer:
             self.config['primary_sort_key'] = DEFAULT_PRIMARY_SORT_KEY
         else:
             logger.info(f"使用排序策略：主要因素={SUPPORTED_SORT_KEYS[primary_sort_key]}，次要因素=累计添加任务数，第三因素=空闲空间")
-            
-        # 验证快速汇报分类黑名单配置
-        blacklist = self.config.get('fast_announce_category_blacklist')
-        if blacklist is not None:
-            if not isinstance(blacklist, list):
-                logger.warning(f"fast_announce_category_blacklist 配置格式错误，必须是数组，当前类型：{type(blacklist)}，已重置为空数组")
-                self.config['fast_announce_category_blacklist'] = []
-            else:
-                # 验证数组中的每个元素都是字符串
-                valid_blacklist = []
-                for item in blacklist:
-                    if isinstance(item, str):
-                        valid_blacklist.append(item)
-                    else:
-                        logger.warning(f"黑名单中包含非字符串项目：{item} (类型：{type(item)})，已忽略")
-                
-                self.config['fast_announce_category_blacklist'] = valid_blacklist
-                if valid_blacklist:
-                    logger.info(f"快速汇报分类黑名单已配置，包含 {len(valid_blacklist)} 个分类：{valid_blacklist}")
-                else:
-                    logger.info("快速汇报分类黑名单为空，所有分类都将执行快速汇报")
-        else:
-            # 如果没有配置黑名单，设置为空数组
-            self.config['fast_announce_category_blacklist'] = []
-            logger.info("未配置快速汇报分类黑名单，所有分类都将执行快速汇报")
-            
+
     def _load_config(self, config_file: str) -> dict:
         """加载配置文件"""
         try:
@@ -264,14 +236,7 @@ class QBittorrentLoadBalancer:
     
     def _set_config_defaults(self) -> None:
         """设置配置默认值和验证"""
-        # 设置快速汇报间隔默认值，并限制在2-10秒范围内
-        fast_interval = self.config.get('fast_announce_interval', 3)
-        if not isinstance(fast_interval, (int, float)) or fast_interval < 2 or fast_interval > 10:
-            logger.warning(f"fast_announce_interval 值无效 ({fast_interval})，必须在2-10秒范围内，使用默认值4秒")
-            fast_interval = 3
-        self.config['fast_announce_interval'] = fast_interval
-        
-        logger.info(f"状态更新间隔配置：快速检查={fast_interval}秒，正常检查={fast_interval * 2}秒")
+        logger.info(f"状态更新间隔配置：{STATUS_REFRESH_INTERVAL}秒")
 
     def _init_instances(self) -> None:
         """初始化qBittorrent实例连接"""
@@ -463,9 +428,6 @@ class QBittorrentLoadBalancer:
             """尝试更新实例状态的内部函数"""
             maindata = instance.client.sync_maindata()
             self._update_instance_metrics(instance, maindata)
-            self._process_instance_announces(instance, maindata)
-            #self._add_peers_for_retry_torrents(instance, maindata)
-            #self._save_torrent_peers_to_csv(instance, maindata)
         
         # 第一次尝试
         try:
@@ -565,207 +527,6 @@ class QBittorrentLoadBalancer:
             logger.warning(f"实例 {instance.name} 流量超限：出站流量={instance.traffic_out/BYTES_TO_GB:.2f}GB，限制={instance.traffic_limit/BYTES_TO_GB:.2f}GB")
         
         return within_limit
-                   
-    def _process_instance_announces(self, instance: InstanceInfo, maindata: dict) -> None:
-        """处理实例的种子汇报检查"""
-        # 如果debug_add_stopped为True，直接返回，不做任何处理
-        if self.config.get('debug_add_stopped', False):
-            return
-            
-        # 如果快速汇报开关未启用，直接返回，不做任何处理
-        if not self.config.get('fast_announce_enabled', False):
-            return
-
-        max_retries = self.config.get('max_announce_retries', 12)
-        error_keywords = ["unregistered", "not registered", "not found", "not exist"]
-        current_time = datetime.now()
-
-        all_torrents_items = maindata.get('torrents', {}).items()
-
-        for torrent_hash, torrent in all_torrents_items:
-            age_seconds = (current_time - datetime.fromtimestamp(torrent.added_on)).total_seconds()
-            is_completed = torrent.progress == 1.0
-
-            # 条件1：如果种子已完成或添加超过2分钟，则确保其已从监控列表中移除，并跳过
-            if (is_completed and age_seconds > 60) or age_seconds > 140 or age_seconds < 2:
-                if torrent_hash in self.announce_retry_counts:
-                    del self.announce_retry_counts[torrent_hash]
-                    if is_completed:
-                        reason = "已完成"
-                    elif age_seconds > 120:
-                        reason = "超过2分钟"
-                    else:
-                        reason = "添加时间小于2秒"
-                    logger.debug(f"停止汇报监控: {torrent.name} (原因: {reason})")
-                continue
-                
-            # 检查种子分类是否在快速汇报黑名单中
-            blacklist = self.config.get('fast_announce_category_blacklist', [])
-            if blacklist and hasattr(torrent, 'category') and torrent.category in blacklist:
-                # 如果种子分类在黑名单中，从监控列表中移除并跳过
-                if torrent_hash in self.announce_retry_counts:
-                    del self.announce_retry_counts[torrent_hash]
-                    logger.debug(f"跳过快速汇报: {torrent.name} (分类 '{torrent.category}' 在黑名单中)")
-                continue
-                
-            # 条件2：如果种子未完成且未超过2分钟，则进行汇报检查
-            # 初始化或递增重试计数器
-            if torrent_hash not in self.announce_retry_counts:
-                self.announce_retry_counts[torrent_hash] = 0
-            
-            # 每次进入函数时递增计数器
-            self.announce_retry_counts[torrent_hash] += 1
-            current_retries = self.announce_retry_counts[torrent_hash]
-            
-            logger.debug(f"汇报检查: {torrent.name} (第{current_retries}次检查，最大{max_retries}次)")
-
-            # 检查是否达到1分钟或者2分钟且种子仍未完成，如果是则强制汇报
-            fast_interval = self.config.get('fast_announce_interval', 3)
-            first_force_announce = int(60 / fast_interval)
-            second_force_announce = int(120 / fast_interval)
-            if (current_retries == first_force_announce or current_retries == second_force_announce) and not is_completed:
-                logger.info(f"达到特定次数({current_retries})且种子未完成，强制汇报: {torrent.name}")
-                self._announce_torrent(instance, torrent, torrent_hash, f"强制汇报(第{current_retries}次检查)")
-                continue
-
-            # 如果还没到最大重试次数，继续正常的汇报条件检查
-            if current_retries < max_retries:
-                # 检查汇报条件
-                needs_announce = False
-                reason = []
-
-                try:
-                    # 1. 检查Tracker状态
-                    trackers = instance.client.torrents_trackers(torrent_hash=torrent_hash)
-                    
-                    # Filter out non-HTTP trackers and special trackers like DHT, PEX, LSD
-                    filtered_trackers = []
-                    for t in trackers:
-                        # DHT, PEX, and LSD are peer sources, not trackers. The API returns them
-                        # in the tracker list, but their 'url' is just a name like 'dht'.
-                        if t.url.lower() in ('dht', 'pex', 'lsd'):
-                            continue
-                        if not t.url.startswith(('http://', 'https://')):
-                            continue
-                        filtered_trackers.append(t)
-
-                    if not filtered_trackers:
-                        logger.info(f"[{instance.name}] Announce check for '{torrent.name}': No valid HTTP trackers found, skipping.")
-                        continue
-
-                    all_trackers_failed = all(t.status in [1, 3, 4] for t in filtered_trackers)
-                    has_error_keyword = any(keyword in t.msg.lower() for t in filtered_trackers for keyword in error_keywords)
-
-                    if all_trackers_failed:
-                        needs_announce = True
-                        reason.append("所有tracker状态异常")
-                    if has_error_keyword:
-                        needs_announce = True
-                        reason.append("发现tracker错误信息")
-
-                    # 2. 检查Peer数量
-                    if torrent.progress < 0.8 and torrent.num_leechs < 2:
-                        needs_announce = True
-                        reason.append(f"Peer数量不足({torrent.num_leechs})")
-
-                    # 执行汇报
-                    if needs_announce:
-                        self._announce_torrent(instance, torrent, torrent_hash, ", ".join(reason))
-
-                except Exception as e:
-                    logger.warning(f"处理 {torrent.name} 的汇报时出错: {e}")
-
-    def _announce_torrent(self, instance: InstanceInfo, torrent: any, torrent_hash: str, reason: str) -> None:
-        """对单个种子执行announce"""
-        try:
-            instance.client.torrents_reannounce(torrent_hashes=torrent_hash)
-            current_retries = self.announce_retry_counts.get(torrent_hash, 0)
-            logger.info(f"触发汇报: {torrent.name} (原因: {reason}) | "
-                        f"尝试次数: {current_retries}")
-        except Exception as e:
-            logger.warning(f"汇报失败: {torrent.name}，错误: {e}")
-    
-    def _save_torrent_peers_to_csv(self, instance: InstanceInfo, maindata: dict) -> None:
-        """保存种子peer列表到CSV文件"""
-        all_torrents_items = maindata.get('torrents', {}).items()
-        
-        for torrent_hash, torrent in all_torrents_items:
-            # 检查种子是否在announce_retry_counts中
-            if torrent_hash not in self.announce_retry_counts:
-                continue
-                
-            # 检查种子状态是否为正在下载中
-            if torrent.state != 'downloading':
-                continue
-            
-            # 检查./logs目录中是否已有以此hash命名的csv文件
-            csv_filename = f"./logs/{torrent_hash}.csv"
-            if os.path.exists(csv_filename):
-                continue
-                
-            try:
-                # 获取种子的peer列表
-                # 使用qbittorrent-api库提供的官方方法
-                peers_data = instance.client.sync_torrent_peers(torrent_hash=torrent_hash)
-                peers = peers_data.get('peers', {})
-                
-                if not peers:
-                    logger.debug(f"种子 {torrent.name} 没有peer连接")
-                    continue
-                
-                # 确保logs目录存在
-                os.makedirs('./logs', exist_ok=True)
-                
-                # 保存peer信息到CSV文件
-                with open(csv_filename, 'w', newline='', encoding='utf-8') as csvfile:
-                    fieldnames = ['ip', 'port', 'client', 'country', 'downloaded', 'uploaded', 'progress']
-                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-                    
-                    # 写入表头
-                    writer.writeheader()
-                    
-                    # 写入peer数据
-                    for peer_id, peer_info in peers.items():
-                        writer.writerow({
-                            'ip': peer_info.get('ip', ''),
-                            'port': peer_info.get('port', ''),
-                            'client': peer_info.get('client', ''),
-                            'country': peer_info.get('country', ''),
-                            'downloaded': peer_info.get('downloaded', 0),
-                            'uploaded': peer_info.get('uploaded', 0),
-                            'progress': peer_info.get('progress', 0)
-                        })
-                
-                logger.info(f"已保存种子 {torrent.name} 的peer列表到 {csv_filename}，共 {len(peers)} 个peer")
-                
-            except Exception as e:
-                logger.warning(f"保存种子 {torrent.name} 的peer列表失败: {e}")
-                    
-
-    def _add_peers_for_retry_torrents(self, instance: InstanceInfo, maindata: dict) -> None:
-        """为重试次数为1的种子添加指定的peer"""
-        try:
-            # 预定义的peer列表
-            peers_to_add = ["213.227.151.211:30957", "45.87.251.103:58929"]
-            
-            # 获取当前实例的种子列表
-            torrents_in_instance = maindata.get('torrents', {})
-            
-            # 只处理当前实例中存在且重试次数为1的种子
-            for torrent_hash, retry_count in self.announce_retry_counts.items():
-                # 检查种子是否在当前实例中存在且重试次数为1
-                if retry_count == 1 and torrent_hash in torrents_in_instance:
-                    try:
-                        # 为种子添加peer
-                        instance.client.torrents_add_peers(torrent_hashes=torrent_hash, peers=peers_to_add)
-                        logger.info(f"已为种子 {torrent_hash} 添加peer: {', '.join(peers_to_add)} (实例: {instance.name})")
-                    except Exception as e:
-                        logger.warning(f"为种子 {torrent_hash} 添加peer失败：{e} (实例: {instance.name})")
-                        
-        except Exception as e:
-            logger.error(f"添加peer过程中发生错误：{instance.name}，错误：{e}")
-
-
     def _get_primary_sort_value(self, instance: InstanceInfo) -> float:
         """获取主要排序因素的值"""
         primary_sort_key = self.config.get('primary_sort_key', DEFAULT_PRIMARY_SORT_KEY)
@@ -919,13 +680,7 @@ class QBittorrentLoadBalancer:
                 self._update_instance_status()
                 self._log_status_summary()
                 self._check_and_schedule_reconnects()
-                              
-                # 根据是否有待重试的汇报任务来调整检查频率
-                fast_interval = self.config['fast_announce_interval']
-                if self.announce_retry_counts:
-                    self._wait_for_next_status_refresh(fast_interval)  # 有待重试任务时的快速检查频率
-                else:
-                    self._wait_for_next_status_refresh(fast_interval * 2)  # 正常情况下的检查频率
+                self._wait_for_next_status_refresh(STATUS_REFRESH_INTERVAL)
                 
             except Exception as e:
                 logger.error(f"状态更新线程错误：{e}")
