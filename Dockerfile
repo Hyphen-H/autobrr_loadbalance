@@ -1,5 +1,5 @@
-# 使用Python 3.11的官方镜像作为基础镜像
-FROM python:3.11-slim
+# 使用Python 3.12的官方镜像作为基础镜像
+FROM python:3.12-slim
 
 # 设置工作目录
 WORKDIR /app
@@ -40,7 +40,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import os; exit(0 if os.path.exists('/app/config.json') else 1)"
 
 # 暴露webhook端口
-EXPOSE 5000
+EXPOSE 50000
 
 # 启动命令
 CMD ["python", "run.py"] 
