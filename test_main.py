@@ -1,4 +1,7 @@
 import sys
+import json
+import os
+import tempfile
 import threading
 import types
 import unittest
@@ -13,6 +16,7 @@ sys.modules.setdefault(
         Flask=object,
         request=types.SimpleNamespace(get_json=lambda: None),
         jsonify=lambda *args, **kwargs: None,
+        render_template=lambda *args, **kwargs: None,
     ),
 )
 
@@ -222,6 +226,92 @@ class StatusUpdateTest(unittest.TestCase):
         balancer._update_single_instance(instance)
 
         self.assertEqual(1, instance.success_metrics_count)
+
+
+class DashboardConfigurationTest(unittest.TestCase):
+    def _balancer(self, config, config_file):
+        balancer = main.QBittorrentLoadBalancer.__new__(main.QBittorrentLoadBalancer)
+        balancer.config = config
+        balancer.config_file = config_file
+        balancer.config_lock = threading.Lock()
+        balancer.instances_lock = threading.Lock()
+        balancer.pending_torrents_lock = threading.Lock()
+        balancer.instances = []
+        balancer.pending_torrents = []
+        return balancer
+
+    def test_empty_whitelist_allows_all_and_cidr_restricts_sources(self):
+        balancer = self._balancer({'webhook_ip_whitelist': []}, os.devnull)
+        self.assertTrue(balancer.is_webhook_ip_allowed('203.0.113.8'))
+
+        balancer.config['webhook_ip_whitelist'] = ['192.168.10.0/24', '2001:db8::1']
+        self.assertTrue(balancer.is_webhook_ip_allowed('192.168.10.42'))
+        self.assertTrue(balancer.is_webhook_ip_allowed('2001:db8::1'))
+        self.assertFalse(balancer.is_webhook_ip_allowed('192.168.11.42'))
+
+    def test_whitelist_change_is_normalized_and_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = os.path.join(directory, 'config.json')
+            balancer = self._balancer({'webhook_ip_whitelist': []}, config_file)
+
+            normalized = balancer.add_webhook_whitelist_entry('192.168.20.44/24')
+
+            self.assertEqual('192.168.20.0/24', normalized)
+            with open(config_file, encoding='utf-8') as handle:
+                persisted = json.load(handle)
+            self.assertEqual(['192.168.20.0/24'], persisted['webhook_ip_whitelist'])
+
+    def test_import_old_config_preserves_dashboard_access_and_adds_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = os.path.join(directory, 'config.json')
+            current = {
+                'dashboard': {'enabled': True, 'username': 'admin', 'password': 'secret'},
+                'telegram': {'enabled': False},
+                'webhook_ip_whitelist': ['10.0.0.0/8'],
+                'connection_timeout': 1,
+                'qbittorrent_instances': [],
+            }
+            balancer = self._balancer(current, config_file)
+            old_config = {
+                'qbittorrent_instances': [{
+                    'name': 'legacy', 'url': 'http://qb:8080',
+                    'username': 'admin', 'password': 'pass',
+                }],
+                'webhook_path': '/legacy-hook',
+            }
+
+            with mock.patch.object(balancer, '_connect_instance', side_effect=lambda instance: setattr(instance, 'is_connected', True)):
+                result = balancer.import_config(old_config)
+
+            self.assertEqual(1, result['connected'])
+            self.assertTrue(result['restart_required'])
+            self.assertEqual('admin', balancer.config['dashboard']['username'])
+            self.assertEqual(['10.0.0.0/8'], balancer.config['webhook_ip_whitelist'])
+            self.assertEqual(2, balancer.config['max_new_tasks_per_instance'])
+            self.assertEqual('legacy', balancer.instances[0].name)
+
+    def test_dashboard_telegram_update_preserves_blank_token_and_reloads_notifier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = os.path.join(directory, 'config.json')
+            config = {
+                'telegram': {'enabled': False, 'bot_token': 'saved-token', 'chat_id': 'old-chat'},
+                'qbittorrent_instances': [],
+            }
+            balancer = self._balancer(config, config_file)
+            old_notifier = mock.Mock()
+            new_notifier = mock.Mock(enabled=True)
+            balancer.telegram_notifier = old_notifier
+
+            with mock.patch.object(main, 'TelegramNotifier', return_value=new_notifier):
+                result = balancer.update_telegram_config({
+                    'enabled': True, 'bot_token': '', 'chat_id': 'new-chat', 'timeout': 12,
+                })
+
+            old_notifier.stop.assert_called_once_with()
+            self.assertIs(new_notifier, balancer.telegram_notifier)
+            self.assertTrue(result['enabled'])
+            self.assertEqual('saved-token', balancer.config['telegram']['bot_token'])
+            self.assertEqual('new-chat', balancer.config['telegram']['chat_id'])
 
 
 if __name__ == "__main__":

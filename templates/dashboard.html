@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QB Load Balancer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">OPERATIONS CONSOLE</p>
+      <h1>QB Load Balancer</h1>
+    </div>
+    <div class="header-meta">
+      <span id="connection-state" class="live"><i></i>实时状态</span>
+      <time id="updated-at">--</time>
+    </div>
+  </header>
+
+  <main>
+    <section class="summary" aria-label="运行摘要">
+      <div><span>已连接实例</span><strong id="connected-count">--</strong></div>
+      <div><span>当前上传</span><strong id="total-upload">--</strong></div>
+      <div><span>当前下载</span><strong id="total-download">--</strong></div>
+      <div><span>等待分配</span><strong id="pending-count">--</strong></div>
+    </section>
+
+    <section class="workspace">
+      <div class="section-head">
+        <div><h2>qBittorrent 实例</h2><p>速度、任务与磁盘余量每 5 秒刷新</p></div>
+        <div class="actions">
+          <label class="button secondary" for="config-file">导入 config.json</label>
+          <input id="config-file" type="file" accept="application/json,.json" hidden>
+          <button id="add-instance" class="button" type="button">添加实例</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>实例</th><th>上传 / 下载</th><th>下载任务</th><th>剩余 / 保留空间</th><th>流量</th><th>累计添加</th><th>操作</th></tr></thead>
+          <tbody id="instances-body"><tr><td colspan="7" class="empty">正在读取实例状态...</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="lower-grid">
+      <section class="workspace">
+        <div class="section-head"><div><h2>Webhook IP 白名单</h2><p><code>{{ webhook_path }}</code></p></div></div>
+        <form id="whitelist-form" class="inline-form">
+          <input id="whitelist-entry" name="entry" placeholder="192.168.1.10 或 10.0.0.0/24" autocomplete="off" required>
+          <button class="button" type="submit">添加</button>
+        </form>
+        <p id="whitelist-mode" class="notice"></p>
+        <div id="whitelist-list" class="tag-list"></div>
+      </section>
+
+      <section class="workspace">
+        <div class="section-head"><div><h2>Telegram Bot</h2><p>分配结果与实例状态通知</p></div></div>
+        <form id="telegram-form" class="settings-form">
+          <label class="toggle-row">
+            <span><strong>启用通知</strong><small id="telegram-state">尚未配置</small></span>
+            <input id="telegram-enabled" type="checkbox"><i aria-hidden="true"></i>
+          </label>
+          <label>Bot Token<input id="telegram-token" type="password" autocomplete="new-password" placeholder="留空则保持当前 Token"></label>
+          <div class="settings-grid">
+            <label>Chat ID<input id="telegram-chat-id" autocomplete="off" placeholder="例如 123456789"></label>
+            <label>请求超时 (秒)<input id="telegram-timeout" type="number" min="1" max="60" value="10"></label>
+          </div>
+          <p id="telegram-error" class="form-error" role="alert"></p>
+          <div class="settings-actions"><button id="test-telegram" class="button secondary" type="button">发送测试通知</button><button id="save-telegram" class="button" type="submit">保存配置</button></div>
+        </form>
+      </section>
+
+      <section class="workspace events-panel">
+        <div class="section-head"><div><h2>最近事件</h2><p>保留最近的请求与配置变更</p></div></div>
+        <ol id="events-list" class="events"><li class="empty">暂无事件</li></ol>
+      </section>
+    </div>
+  </main>
+
+  <dialog id="instance-dialog">
+    <form id="instance-form" method="dialog">
+      <div class="dialog-head"><h2 id="dialog-title">添加实例</h2><button class="close" type="button" data-close-dialog aria-label="关闭" title="关闭">×</button></div>
+      <input id="original-name" type="hidden">
+      <div class="form-grid">
+        <label>名称<input id="instance-name" required></label>
+        <label>Web UI 地址<input id="instance-url" type="url" placeholder="http://192.168.1.100:8080" required></label>
+        <label>用户名<input id="instance-username" required></label>
+        <label>密码<input id="instance-password" type="password"><small id="password-hint"></small></label>
+        <label>流量检查 URL<input id="traffic-url" type="url" placeholder="可选"></label>
+        <label>流量限制 (MB)<input id="traffic-limit" type="number" min="0" step="1" value="0"></label>
+        <label>保留空间 (MB)<input id="reserved-space" type="number" min="0" step="1" value="21504"></label>
+      </div>
+      <p id="instance-error" class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button id="save-instance" class="button" type="submit">保存并连接</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
+</body>
+</html>

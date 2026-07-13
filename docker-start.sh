@@ -23,8 +23,13 @@ check_docker() {
         exit 1
     fi
     
-    if ! command -v docker compose &> /dev/null; then
-        print_message "Docker Compose 未安装！请先安装 Docker Compose。" $RED
+    if ! docker compose version &> /dev/null; then
+        print_message "Docker Compose Plugin 未安装或不可用！" $RED
+        exit 1
+    fi
+
+    if ! docker info &> /dev/null; then
+        print_message "无法连接 Docker daemon，请检查服务状态和当前用户权限。" $RED
         exit 1
     fi
 }
@@ -32,8 +37,7 @@ check_docker() {
 # 创建必要的目录
 create_directories() {
     print_message "创建必要的目录..." $BLUE
-    mkdir -p torrents logs
-    chmod 755 torrents logs
+    mkdir -p logs
 }
 
 # 检查配置文件
@@ -55,7 +59,19 @@ check_config() {
 # 构建Docker镜像
 build_image() {
     print_message "构建 Docker 镜像..." $BLUE
-    docker build -t qbittorrent-loadbalancer .
+    docker build --pull -t qbittorrent-loadbalancer .
+}
+
+# 让非root容器用户可以写入Dashboard配置和日志目录
+prepare_permissions() {
+    print_message "设置配置文件和日志目录权限..." $BLUE
+    docker run --rm \
+        --user root \
+        --entrypoint sh \
+        -v "$(pwd)/config.json:/app/config.json" \
+        -v "$(pwd)/logs:/app/logs" \
+        qbittorrent-loadbalancer \
+        -c 'chown appuser:appuser /app/config.json && chown -R appuser:appuser /app/logs'
 }
 
 # 显示使用帮助
@@ -70,7 +86,7 @@ show_help() {
     echo "  build           构建镜像"
     echo "  prod            启动生产环境（同start）"
     echo "  status          查看服务状态"
-    echo "  clean           清理停止的容器"
+    echo "  clean           清理当前Compose项目的容器"
     echo "  help            显示此帮助信息"
 }
 
@@ -78,12 +94,16 @@ show_help() {
 case "${1:-start}" in
     "start"|"prod")
         check_docker
-        # create_directories
+        create_directories
         check_config
         build_image
+        prepare_permissions
         print_message "启动负载均衡器..." $GREEN
         docker compose up -d
         print_message "服务已启动！" $GREEN
+        print_message "Dashboard: http://<服务器IP>:50000/dashboard" $BLUE
+        print_message "健康检查: curl http://127.0.0.1:50000/health" $BLUE
+        print_message "查看日志: ./docker-start.sh logs" $BLUE
         ;;
     
     "stop")
@@ -110,14 +130,16 @@ case "${1:-start}" in
         ;;
     
     "status")
+        check_docker
         print_message "服务状态:" $BLUE
-        docker ps --filter "name=qbt" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+        docker compose ps
         ;;
     
     "clean")
-        print_message "清理停止的容器..." $YELLOW
-        docker container prune -f
-        print_message "清理完成！" $GREEN
+        check_docker
+        print_message "清理当前Compose项目的容器..." $YELLOW
+        docker compose down --remove-orphans
+        print_message "当前项目容器已清理！" $GREEN
         ;;
     
     "help"|"-h"|"--help")
@@ -129,4 +151,4 @@ case "${1:-start}" in
         show_help
         exit 1
         ;;
-esac 
+esac

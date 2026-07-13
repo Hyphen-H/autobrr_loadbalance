@@ -6,6 +6,8 @@ qBittorrent Load Balancer
 
 import json
 import os
+import ipaddress
+import tempfile
 import time
 import threading
 import logging
@@ -16,6 +18,7 @@ from dataclasses import dataclass, field
 
 import qbittorrentapi
 from webhook_server import WebhookServer
+from telegram_notifier import TelegramNotifier
 
 
 # 配置常量
@@ -164,21 +167,25 @@ class PendingTorrent:
     download_url: str
     release_name: str
     category: Optional[str] = None
+    failure_notified: bool = False
 
 
 class QBittorrentLoadBalancer:
     """qBittorrent负载均衡器"""
     
     def __init__(self, config_file: str = DEFAULT_CONFIG_FILE):
+        self.config_file = os.path.abspath(config_file)
         self.config = self._load_config(config_file)        
         self.instances: List[InstanceInfo] = []
         self.pending_torrents: List[PendingTorrent] = []
         self.pending_torrents_lock = threading.Lock()
         self.instances_lock = threading.Lock()
         self.status_refresh_event = threading.Event()
+        self.config_lock = threading.Lock()
         
         # 重新配置日志（支持文件输出）
         self._setup_logging()
+        self.telegram_notifier = TelegramNotifier(self.config)
         
         # 初始化webhook服务器
         self.webhook_server: Optional[WebhookServer] = None
@@ -236,6 +243,10 @@ class QBittorrentLoadBalancer:
     
     def _set_config_defaults(self) -> None:
         """设置配置默认值和验证"""
+        self.config.setdefault('max_new_tasks_per_instance', 2)
+        self.config.setdefault('webhook_ip_whitelist', [])
+        self.config.setdefault('telegram', {'enabled': False})
+        self.config.setdefault('dashboard', {'enabled': False})
         logger.info(f"状态更新间隔配置：{STATUS_REFRESH_INTERVAL}秒")
 
     def _init_instances(self) -> None:
@@ -292,6 +303,7 @@ class QBittorrentLoadBalancer:
             instance.is_connected = False
             # 记录连接失败的时间，用于后续重连判断
             instance.last_update = datetime.now()
+            self._notify(f"[实例离线] {instance.name}\n初始连接失败：{e}")
             
     def _attempt_reconnect(self, instance: InstanceInfo) -> bool:
         """尝试重新连接到实例"""
@@ -319,6 +331,7 @@ class QBittorrentLoadBalancer:
                     instance.is_reconnecting = False
                     
                 logger.info(f"重新连接成功：{instance.name}（尝试 {attempt + 1}/{max_attempts}）")
+                self._notify(f"[实例恢复] {instance.name}\n已重新连接")
                 return True
                 
             except Exception as e:
@@ -327,6 +340,7 @@ class QBittorrentLoadBalancer:
                     time.sleep(2)  # 每次重连尝试间等待2秒
                     
         logger.error(f"重连彻底失败：{instance.name}")
+        self._notify(f"[重连失败] {instance.name}\n已尝试 {max_attempts} 次")
         
         # 更新失败时间需要在锁内进行
         with self.instances_lock:
@@ -412,6 +426,294 @@ class QBittorrentLoadBalancer:
                     
         except Exception as e:
             logger.error(f"添加种子失败：{release_name}，错误：{e}")
+
+    def _notify(self, message: str) -> None:
+        """Queue a Telegram notification when configured."""
+        notifier = getattr(self, 'telegram_notifier', None)
+        if notifier:
+            notifier.send(message)
+
+    def get_dashboard_snapshot(self) -> dict:
+        """Return a JSON-safe snapshot for the dashboard."""
+        with self.instances_lock:
+            instances = [
+                {
+                    'name': instance.name,
+                    'connected': instance.is_connected,
+                    'reconnecting': instance.is_reconnecting,
+                    'upload_speed_kib': round(instance.upload_speed, 1),
+                    'download_speed_kib': round(instance.download_speed, 1),
+                    'active_downloads': instance.active_downloads,
+                    'waiting_downloads': instance.waiting_downloads_count,
+                    'free_space_gib': round(instance.free_space / BYTES_TO_GB, 1),
+                    'reserved_space_gib': round(instance.reserved_space / BYTES_TO_GB, 1),
+                    'traffic_out_gib': round(instance.traffic_out / BYTES_TO_GB, 2),
+                    'traffic_limit_gib': round(instance.traffic_limit / BYTES_TO_GB, 2),
+                    'total_added_tasks': instance.total_added_tasks_count,
+                    'last_update': instance.last_update.isoformat(),
+                }
+                for instance in self.instances
+            ]
+        with self.pending_torrents_lock:
+            pending_count = len(self.pending_torrents)
+        with self.config_lock:
+            whitelist = list(self.config.get('webhook_ip_whitelist', []))
+            telegram = self.config.get('telegram', {})
+            active_notifier = getattr(self, 'telegram_notifier', None)
+            telegram_status = {
+                'enabled': bool(active_notifier and active_notifier.enabled),
+                'chat_id': str(telegram.get('chat_id', '')),
+                'bot_token_configured': bool(telegram.get('bot_token')),
+                'timeout': telegram.get('timeout', 10),
+            }
+            configured_instances = [
+                {
+                    'name': item.get('name', ''),
+                    'url': item.get('url', ''),
+                    'username': item.get('username', ''),
+                    'has_password': bool(item.get('password')),
+                    'traffic_check_url': item.get('traffic_check_url', ''),
+                    'traffic_limit': item.get('traffic_limit', 0),
+                    'reserved_space': item.get('reserved_space', 21 * 1024),
+                }
+                for item in self.config.get('qbittorrent_instances', [])
+            ]
+        return {
+            'instances': instances,
+            'configured_instances': configured_instances,
+            'pending_count': pending_count,
+            'whitelist': whitelist,
+            'telegram': telegram_status,
+            'sort_key': self.config.get('primary_sort_key', DEFAULT_PRIMARY_SORT_KEY),
+            'updated_at': datetime.now().isoformat(),
+        }
+
+    def is_webhook_ip_allowed(self, address: str) -> bool:
+        """Check an address against the configured IP/CIDR whitelist."""
+        try:
+            client_ip = ipaddress.ip_address(address)
+        except ValueError:
+            return False
+        with self.config_lock:
+            entries = list(self.config.get('webhook_ip_whitelist', []))
+        if not entries:
+            return True
+        for entry in entries:
+            try:
+                if client_ip in ipaddress.ip_network(entry, strict=False):
+                    return True
+            except ValueError:
+                logger.warning("忽略无效的Webhook白名单项：%s", entry)
+        return False
+
+    def add_webhook_whitelist_entry(self, entry: str) -> str:
+        """Validate, normalize and persist an IP/CIDR whitelist entry."""
+        network = ipaddress.ip_network(entry.strip(), strict=False)
+        normalized = str(network.network_address) if network.prefixlen == network.max_prefixlen else str(network)
+        with self.config_lock:
+            candidate = json.loads(json.dumps(self.config))
+            entries = candidate.setdefault('webhook_ip_whitelist', [])
+            if normalized not in entries:
+                entries.append(normalized)
+                self._replace_config_locked(candidate)
+        return normalized
+
+    def remove_webhook_whitelist_entry(self, entry: str) -> bool:
+        with self.config_lock:
+            candidate = json.loads(json.dumps(self.config))
+            entries = candidate.setdefault('webhook_ip_whitelist', [])
+            if entry not in entries:
+                return False
+            entries.remove(entry)
+            self._replace_config_locked(candidate)
+            return True
+
+    def _replace_config_locked(self, candidate: dict) -> None:
+        """Persist and activate candidate config. Caller must hold config_lock."""
+        directory = os.path.dirname(self.config_file) or '.'
+        fd, temporary_path = tempfile.mkstemp(prefix='config-', suffix='.json', dir=directory)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                json.dump(candidate, handle, ensure_ascii=False, indent=4)
+                handle.write('\n')
+            try:
+                os.replace(temporary_path, self.config_file)
+            except OSError:
+                # Docker bind-mounted files cannot always be replaced by rename.
+                with open(self.config_file, 'w', encoding='utf-8') as handle:
+                    json.dump(candidate, handle, ensure_ascii=False, indent=4)
+                    handle.write('\n')
+                os.unlink(temporary_path)
+            self.config.clear()
+            self.config.update(candidate)
+        except Exception:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+            raise
+
+    def upsert_qbittorrent_instance(self, payload: dict, original_name: str = '') -> dict:
+        """Create or update an instance, persist it and apply it immediately."""
+        required = ('name', 'url', 'username')
+        values = {key: str(payload.get(key, '')).strip() for key in required}
+        if any(not values[key] for key in required):
+            raise ValueError('name, url and username are required')
+
+        with self.config_lock:
+            candidate = json.loads(json.dumps(self.config))
+            configs = candidate.setdefault('qbittorrent_instances', [])
+            existing_index = next(
+                (index for index, item in enumerate(configs) if item.get('name') == original_name),
+                None,
+            ) if original_name else None
+            if any(
+                item.get('name') == values['name'] and index != existing_index
+                for index, item in enumerate(configs)
+            ):
+                raise ValueError('instance name already exists')
+            previous = configs[existing_index] if existing_index is not None else {}
+            password = str(payload.get('password', '')) or str(previous.get('password', ''))
+            if not password:
+                raise ValueError('password is required for a new instance')
+            instance_config = {
+                'name': values['name'],
+                'url': values['url'],
+                'username': values['username'],
+                'password': password,
+                'traffic_check_url': str(payload.get('traffic_check_url', '')).strip(),
+                'traffic_limit': self._non_negative_number(payload.get('traffic_limit', 0), 'traffic_limit'),
+                'reserved_space': self._non_negative_number(payload.get('reserved_space', 21 * 1024), 'reserved_space'),
+            }
+            new_instance = self._create_instance_from_config(instance_config)
+            self._connect_instance(new_instance)
+            if existing_index is None:
+                configs.append(instance_config)
+            else:
+                configs[existing_index] = instance_config
+            self._replace_config_locked(candidate)
+
+        with self.instances_lock:
+            runtime_index = next(
+                (index for index, item in enumerate(self.instances) if item.name == original_name),
+                None,
+            ) if original_name else None
+            if runtime_index is None:
+                self.instances.append(new_instance)
+            else:
+                new_instance.total_added_tasks_count = self.instances[runtime_index].total_added_tasks_count
+                self.instances[runtime_index] = new_instance
+        return {'name': new_instance.name, 'connected': new_instance.is_connected}
+
+    def delete_qbittorrent_instance(self, name: str) -> bool:
+        with self.config_lock:
+            candidate = json.loads(json.dumps(self.config))
+            configs = candidate.setdefault('qbittorrent_instances', [])
+            remaining = [item for item in configs if item.get('name') != name]
+            if len(remaining) == len(configs):
+                return False
+            candidate['qbittorrent_instances'] = remaining
+            self._replace_config_locked(candidate)
+        with self.instances_lock:
+            self.instances[:] = [item for item in self.instances if item.name != name]
+        return True
+
+    def import_config(self, imported: dict) -> dict:
+        """Import old or current config and hot-apply qBittorrent instances."""
+        if not isinstance(imported, dict):
+            raise ValueError('config must be a JSON object')
+        configs = imported.get('qbittorrent_instances')
+        if not isinstance(configs, list):
+            raise ValueError('qbittorrent_instances must be a list')
+        normalized_configs = []
+        names = set()
+        for item in configs:
+            if not isinstance(item, dict):
+                raise ValueError('each qBittorrent instance must be an object')
+            for key in ('name', 'url', 'username', 'password'):
+                if not str(item.get(key, '')).strip():
+                    raise ValueError(f'instance {key} is required')
+            if item['name'] in names:
+                raise ValueError('instance names must be unique')
+            names.add(item['name'])
+            normalized_configs.append(dict(item))
+
+        with self.config_lock:
+            candidate = json.loads(json.dumps(imported))
+            for key in ('dashboard', 'telegram', 'webhook_ip_whitelist'):
+                if key not in candidate and key in self.config:
+                    candidate[key] = json.loads(json.dumps(self.config[key]))
+            candidate.setdefault('max_new_tasks_per_instance', 2)
+            candidate.setdefault('webhook_port', 50000)
+            candidate.setdefault('webhook_path', '/webhook')
+            candidate.setdefault('primary_sort_key', DEFAULT_PRIMARY_SORT_KEY)
+            if candidate['primary_sort_key'] not in SUPPORTED_SORT_KEYS:
+                candidate['primary_sort_key'] = DEFAULT_PRIMARY_SORT_KEY
+            new_instances = [self._create_instance_from_config(item) for item in normalized_configs]
+            for instance in new_instances:
+                self._connect_instance(instance)
+            self._replace_config_locked(candidate)
+        with self.instances_lock:
+            self.instances[:] = new_instances
+        previous_notifier = getattr(self, 'telegram_notifier', None)
+        if previous_notifier:
+            previous_notifier.stop()
+        self.telegram_notifier = TelegramNotifier(self.config)
+        return {
+            'instances': len(new_instances),
+            'connected': sum(1 for item in new_instances if item.is_connected),
+            'restart_required': True,
+        }
+
+    def update_telegram_config(self, payload: dict) -> dict:
+        """Persist Telegram settings and replace the notifier immediately."""
+        enabled = bool(payload.get('enabled', False))
+        try:
+            timeout = float(payload.get('timeout', 10))
+        except (TypeError, ValueError):
+            raise ValueError('timeout must be a number')
+        if timeout < 1 or timeout > 60:
+            raise ValueError('timeout must be between 1 and 60 seconds')
+
+        with self.config_lock:
+            candidate = json.loads(json.dumps(self.config))
+            current = candidate.get('telegram', {})
+            bot_token = str(payload.get('bot_token', '')).strip() or str(current.get('bot_token', '')).strip()
+            chat_id = str(payload.get('chat_id', '')).strip() or str(current.get('chat_id', '')).strip()
+            if enabled and (not bot_token or not chat_id):
+                raise ValueError('bot_token and chat_id are required when Telegram is enabled')
+            candidate['telegram'] = {
+                'enabled': enabled,
+                'bot_token': bot_token,
+                'chat_id': chat_id,
+                'timeout': timeout,
+            }
+            self._replace_config_locked(candidate)
+
+        previous = getattr(self, 'telegram_notifier', None)
+        if previous:
+            previous.stop()
+        self.telegram_notifier = TelegramNotifier(self.config)
+        return {
+            'enabled': self.telegram_notifier.enabled,
+            'chat_id': chat_id,
+            'bot_token_configured': bool(bot_token),
+            'timeout': timeout,
+        }
+
+    def send_telegram_test(self) -> bool:
+        notifier = getattr(self, 'telegram_notifier', None)
+        return bool(notifier and notifier.send(
+            f"[测试通知] qBittorrent Load Balancer\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        ))
+
+    @staticmethod
+    def _non_negative_number(value, field_name: str):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f'{field_name} must be a number')
+        if number < 0:
+            raise ValueError(f'{field_name} must not be negative')
+        return int(number) if number.is_integer() else number
             
 
                 
@@ -445,6 +747,7 @@ class QBittorrentLoadBalancer:
             logger.error(f"重试后仍然失败：{instance.name}，错误：{e2}，标记为断开连接")
             instance.is_connected = False
             instance.last_update = datetime.now()
+            self._notify(f"[实例离线] {instance.name}\n状态更新连续失败：{e2}")
                     
     def _update_instance_metrics(self, instance: InstanceInfo, maindata: dict) -> None:
         """使用sync/maindata的结果更新单个实例的状态信息"""
@@ -614,13 +917,32 @@ class QBittorrentLoadBalancer:
                     log_msg += f"（分类：{torrent.category}）"
                 logger.info(log_msg)
                 self._request_status_refresh()
+                self._notify(
+                    f"[种子已添加] {torrent.release_name}\n"
+                    f"实例：{instance.name}\n分类：{torrent.category or '-'}"
+                )
+                webhook_server = getattr(self, 'webhook_server', None)
+                if webhook_server:
+                    webhook_server.record_event('success', torrent.release_name, instance.name)
                 return True
             else:
                 logger.error(f"添加种子失败 - 实例：{instance.name}，种子：{torrent.release_name}，结果：{result}")
+                if not torrent.failure_notified:
+                    self._notify(f"[种子添加失败] {torrent.release_name}\n实例：{instance.name}\n结果：{result}")
+                    webhook_server = getattr(self, 'webhook_server', None)
+                    if webhook_server:
+                        webhook_server.record_event('error', torrent.release_name, instance.name)
+                    torrent.failure_notified = True
                 return False
                 
         except Exception as e:
             logger.error(f"添加种子到实例失败 - 实例：{instance.name}，种子：{torrent.release_name}，错误：{e}")
+            if not torrent.failure_notified:
+                self._notify(f"[种子添加异常] {torrent.release_name}\n实例：{instance.name}\n错误：{e}")
+                webhook_server = getattr(self, 'webhook_server', None)
+                if webhook_server:
+                    webhook_server.record_event('error', torrent.release_name, instance.name)
+                torrent.failure_notified = True
             return False
             
     def _process_torrents(self) -> None:
@@ -637,6 +959,11 @@ class QBittorrentLoadBalancer:
                         self.pending_torrents.remove(torrent)
                 else:
                     logger.warning("没有可用的实例来分配新任务，清空待处理队列")
+                    dropped = [item.release_name for item in self.pending_torrents]
+                    self._notify(f"[分配失败] 没有可用实例\n已丢弃 {len(dropped)} 个待处理任务")
+                    if self.webhook_server:
+                        for release_name in dropped:
+                            self.webhook_server.record_event('error', release_name, '没有可用实例')
                     self.pending_torrents.clear()
                     break
 
@@ -728,6 +1055,7 @@ class QBittorrentLoadBalancer:
             if self.webhook_server:
                 self.webhook_server.stop()
                 logger.info("Webhook服务器已停止")
+            self.telegram_notifier.stop()
 
 
 def main() -> int:
