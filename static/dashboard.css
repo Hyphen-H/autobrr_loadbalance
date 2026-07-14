@@ -154,17 +154,19 @@ input:focus { outline: 2px solid rgb(8 126 139 / 24%); border-color: var(--cyan)
 .log-toolbar select { min-width: 112px; height: 34px; padding: 5px 28px 5px 8px; border: 1px solid #aeb9be; border-radius: 3px; color: #26343a; background: #fff; font: 12px "LXGW Bright", sans-serif; }
 .log-toolbar .check-control { min-height: 34px; display: flex; flex-direction: row; align-items: center; gap: 6px; color: #3f4c52; white-space: nowrap; }
 .check-control input { width: 16px; min-height: 16px; margin: 0; accent-color: var(--green); }
-.log-stream { height: min(68vh, 760px); min-height: 420px; overflow: auto; color: #dbe4e7; background: #111a1e; font: 12px/1.55 ui-monospace, "Cascadia Code", monospace; scrollbar-color: #526168 #111a1e; }
-.log-row { min-width: max-content; padding: 4px 12px; border-bottom: 1px solid #1f2a2f; }
-.log-row:hover { background: #192429; }
+.log-stream { height: min(68vh, 760px); min-height: 420px; overflow: auto; color: #263238; background: #eef1f3; font: 12px/1.55 ui-monospace, "Cascadia Code", monospace; scrollbar-color: #aab4b9 #eef1f3; cursor: text; user-select: text; }
+.log-stream * { user-select: text; }
+.log-stream ::selection { color: #102a22; background: #a9e7d1; }
+.log-row { min-width: max-content; padding: 4px 12px; border-bottom: 1px solid #d8dee1; }
+.log-row:hover { background: #e3e8ea; }
 .log-row.indented { min-width: 0; display: grid; grid-template-columns: 158px 68px minmax(120px, 190px) minmax(260px, 1fr); align-items: start; column-gap: 8px; }
-.log-time { color: #84969d; }
+.log-time { color: #5f6d73; }
 .log-level { font-weight: 700; }
-.log-level.DEBUG { color: #8fa5ad; }
-.log-level.INFO { color: #5bd3ad; }
-.log-level.WARNING { color: #ffc078; }
-.log-level.ERROR, .log-level.CRITICAL { color: #ff8787; }
-.log-name { overflow: hidden; color: #80bfc5; text-overflow: ellipsis; white-space: nowrap; }
+.log-level.DEBUG { color: #65767e; }
+.log-level.INFO { color: #087f5b; }
+.log-level.WARNING { color: #9a5207; }
+.log-level.ERROR, .log-level.CRITICAL { color: #c92a2a; }
+.log-name { overflow: hidden; color: #08727d; text-overflow: ellipsis; white-space: nowrap; }
 .log-message { white-space: pre-wrap; overflow-wrap: anywhere; }
 .log-stream.flat-lines .log-row { display: block; }
 .log-stream.flat-lines .log-time, .log-stream.flat-lines .log-level, .log-stream.flat-lines .log-name { margin-right: 10px; }
