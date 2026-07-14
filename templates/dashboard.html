@@ -92,6 +92,10 @@
         </div>
 
         <div class="view" data-view-panel="traffic">
+          <section class="summary traffic-summary" aria-label="累计流量">
+            <div><span>累计上传</span><strong id="traffic-upload-total">--</strong><small>所有实例</small></div>
+            <div><span>累计下载</span><strong id="traffic-download-total">--</strong><small>所有实例</small></div>
+          </section>
           <div class="chart-grid">
             <section class="panel chart-panel">
               <div class="panel-head"><div><h2>上传吞吐</h2><p>所有已连接实例</p></div><strong id="chart-upload-now">--</strong></div>
@@ -103,11 +107,11 @@
             </section>
           </div>
           <section class="panel">
-            <div class="panel-head"><div><h2>Tracker 统计</h2><p>当前 torrent 数量与实时吞吐</p></div><span id="tracker-count" class="context-label"></span></div>
+            <div class="panel-head"><div><h2>Tracker 统计</h2><p>当前 torrent 数量、实时速度与累计流量</p></div><span id="tracker-count" class="context-label"></span></div>
             <div class="table-wrap">
               <table>
-                <thead><tr><th>Tracker</th><th>实例</th><th>种子数</th><th>活跃下载</th><th>上传</th><th>下载</th></tr></thead>
-                <tbody id="tracker-body"><tr><td colspan="6" class="empty">暂无 tracker 数据</td></tr></tbody>
+                <thead><tr><th>Tracker</th><th>实例</th><th>种子数</th><th>活跃下载</th><th>上传速度</th><th>下载速度</th><th>累计上传</th><th>累计下载</th></tr></thead>
+                <tbody id="tracker-body"><tr><td colspan="8" class="empty">暂无 tracker 数据</td></tr></tbody>
               </table>
             </div>
           </section>

@@ -163,6 +163,8 @@ class InstanceMetricsLoggingTest(unittest.TestCase):
             "server_state": {
                 "up_info_speed": int(1.5 * main.BYTES_TO_KB * main.BYTES_TO_KB),
                 "dl_info_speed": 512 * main.BYTES_TO_KB,
+                "alltime_ul": 3_000_000_000_000,
+                "alltime_dl": 4_000_000_000_000,
                 "free_space_on_disk": 100 * main.BYTES_TO_GB,
             },
             "torrents": {},
@@ -174,6 +176,8 @@ class InstanceMetricsLoggingTest(unittest.TestCase):
         log_message = debug.call_args.args[0]
         self.assertIn("上传=1.5MB/s", log_message)
         self.assertIn("下载=512.0KB/s", log_message)
+        self.assertEqual(3_000_000_000_000, instance.total_uploaded_bytes)
+        self.assertEqual(4_000_000_000_000, instance.total_downloaded_bytes)
 
     def test_metrics_count_waiting_downloads_from_qbittorrent_states(self):
         balancer = main.QBittorrentLoadBalancer.__new__(main.QBittorrentLoadBalancer)
@@ -205,9 +209,9 @@ class InstanceMetricsLoggingTest(unittest.TestCase):
         maindata = {
             "server_state": {},
             "torrents": {
-                "one": types.SimpleNamespace(state="downloading", tracker="https://tracker.example/announce", upspeed=1024, dlspeed=2048),
-                "two": types.SimpleNamespace(state="stalledUP", tracker="https://tracker.example/announce", upspeed=512, dlspeed=0),
-                "three": types.SimpleNamespace(state="pausedDL", tracker="", upspeed=0, dlspeed=0),
+                "one": types.SimpleNamespace(state="downloading", tracker="https://tracker.example/announce", upspeed=1024, dlspeed=2048, uploaded=2_000_000_000_000, downloaded=3_000_000_000_000),
+                "two": types.SimpleNamespace(state="stalledUP", tracker="https://tracker.example/announce", upspeed=512, dlspeed=0, uploaded=500_000_000_000, downloaded=250_000_000_000),
+                "three": types.SimpleNamespace(state="pausedDL", tracker="", upspeed=0, dlspeed=0, uploaded=0, downloaded=0),
             },
         }
 
@@ -217,6 +221,8 @@ class InstanceMetricsLoggingTest(unittest.TestCase):
         self.assertEqual(1, instance.tracker_stats["tracker.example"]["active_downloads"])
         self.assertEqual(1.5, instance.tracker_stats["tracker.example"]["upload_speed_kib"])
         self.assertEqual(2.0, instance.tracker_stats["tracker.example"]["download_speed_kib"])
+        self.assertEqual(2_500_000_000_000, instance.tracker_stats["tracker.example"]["uploaded_bytes"])
+        self.assertEqual(3_250_000_000_000, instance.tracker_stats["tracker.example"]["downloaded_bytes"])
         self.assertEqual(1, instance.tracker_stats["无 tracker"]["torrent_count"])
 
 
@@ -263,6 +269,46 @@ class StatusUpdateTest(unittest.TestCase):
         self.assertEqual(0.0, balancer.metrics_history[0]['upload_speed_kib'])
         self.assertEqual(0.0, balancer.metrics_history[0]['download_speed_kib'])
         self.assertIn('timestamp', balancer.metrics_history[0])
+
+
+class DashboardTrafficSnapshotTest(unittest.TestCase):
+    def test_snapshot_exposes_instance_and_tracker_cumulative_traffic(self):
+        balancer = main.QBittorrentLoadBalancer.__new__(main.QBittorrentLoadBalancer)
+        balancer.instances = [
+            main.InstanceInfo(
+                name="test",
+                url="http://example.invalid",
+                username="user",
+                password="pass",
+                total_uploaded_bytes=3_000_000_000_000,
+                total_downloaded_bytes=4_000_000_000_000,
+                tracker_stats={
+                    "tracker.example": {
+                        "torrent_count": 2,
+                        "active_downloads": 1,
+                        "upload_speed_kib": 1000.0,
+                        "download_speed_kib": 2000.0,
+                        "uploaded_bytes": 2_500_000_000_000,
+                        "downloaded_bytes": 3_250_000_000_000,
+                    }
+                },
+            )
+        ]
+        balancer.instances_lock = threading.Lock()
+        balancer.metrics_history = []
+        balancer.metrics_history_lock = threading.Lock()
+        balancer.pending_torrents = []
+        balancer.pending_torrents_lock = threading.Lock()
+        balancer.config = {"qbittorrent_instances": [], "webhook_ip_whitelist": []}
+        balancer.config_lock = threading.Lock()
+        balancer.telegram_notifier = None
+
+        snapshot = balancer.get_dashboard_snapshot()
+
+        self.assertEqual(3_000_000_000_000, snapshot["traffic_totals"]["uploaded_bytes"])
+        self.assertEqual(4_000_000_000_000, snapshot["traffic_totals"]["downloaded_bytes"])
+        self.assertEqual(2_500_000_000_000, snapshot["tracker_stats"][0]["uploaded_bytes"])
+        self.assertEqual(3_250_000_000_000, snapshot["tracker_stats"][0]["downloaded_bytes"])
 
 
 class DashboardConfigurationTest(unittest.TestCase):

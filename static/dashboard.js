@@ -1,7 +1,7 @@
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 
-let snapshot = { configured_instances: [], instances: [], whitelist: [], events: [], telegram: {}, metrics_history: [], tracker_stats: [] };
+let snapshot = { configured_instances: [], instances: [], whitelist: [], events: [], telegram: {}, metrics_history: [], tracker_stats: [], traffic_totals: {} };
 let toastTimer;
 let telegramDirty = false;
 let draggedColumn = null;
@@ -30,8 +30,12 @@ async function api(path, options = {}) {
 }
 
 function speed(kib) {
-  const value = Number(kib || 0);
-  return value >= 1024 ? `${(value / 1024).toFixed(1)} MiB/s` : `${value.toFixed(1)} KiB/s`;
+  const megabytesPerSecond = Number(kib || 0) * 1024 / 1_000_000;
+  return `${megabytesPerSecond.toFixed(2)} M/s`;
+}
+
+function traffic(bytes) {
+  return `${(Number(bytes || 0) / 1_000_000_000_000).toFixed(3)} TB`;
 }
 
 function showView(name, updateHash = true) {
@@ -225,6 +229,8 @@ function renderSummary() {
   $('#connected-count').textContent = `${connected} / ${snapshot.instances.length}`;
   $('#total-upload').textContent = speed(upload); $('#total-download').textContent = speed(download); $('#pending-count').textContent = snapshot.pending_count;
   $('#chart-upload-now').textContent = speed(upload); $('#chart-download-now').textContent = speed(download);
+  $('#traffic-upload-total').textContent = traffic(snapshot.traffic_totals?.uploaded_bytes);
+  $('#traffic-download-total').textContent = traffic(snapshot.traffic_totals?.downloaded_bytes);
   $('#updated-at').textContent = new Date(snapshot.updated_at).toLocaleString(); $('#sort-key').textContent = `分配策略 · ${sortKeyNames[snapshot.sort_key] || snapshot.sort_key}`;
 }
 
@@ -257,8 +263,8 @@ function drawLineChart(canvas, key, color) {
 
 function renderTrackerStats() {
   const body = $('#tracker-body'); body.replaceChildren(); const trackers = snapshot.tracker_stats || []; $('#tracker-count').textContent = `${trackers.length} TRACKERS`;
-  if (!trackers.length) { const row = document.createElement('tr'); cell(row, '暂无 tracker 数据', 'empty').colSpan = 6; body.append(row); return; }
-  trackers.forEach((tracker) => { const row = document.createElement('tr'); cell(row, tracker.tracker); cell(row, tracker.instances.join(', ')); cell(row, String(tracker.torrent_count)); cell(row, String(tracker.active_downloads)); cell(row, speed(tracker.upload_speed_kib)); cell(row, speed(tracker.download_speed_kib)); body.append(row); });
+  if (!trackers.length) { const row = document.createElement('tr'); cell(row, '暂无 tracker 数据', 'empty').colSpan = 8; body.append(row); return; }
+  trackers.forEach((tracker) => { const row = document.createElement('tr'); cell(row, tracker.tracker); cell(row, tracker.instances.join(', ')); cell(row, String(tracker.torrent_count)); cell(row, String(tracker.active_downloads)); cell(row, speed(tracker.upload_speed_kib)); cell(row, speed(tracker.download_speed_kib)); cell(row, traffic(tracker.uploaded_bytes)); cell(row, traffic(tracker.downloaded_bytes)); body.append(row); });
 }
 
 function renderTraffic() { drawLineChart($('#upload-chart'), 'upload_speed_kib', '#087f5b'); drawLineChart($('#download-chart'), 'download_speed_kib', '#087e8b'); renderTrackerStats(); }
@@ -335,3 +341,4 @@ showView(location.hash.slice(1) || 'overview', false);
 refresh();
 setInterval(refresh, 5000);
 setInterval(() => { if ($('[data-view-panel="logs"]').classList.contains('active')) fetchLogs(); }, 2000);
+if (document.fonts?.ready) document.fonts.ready.then(() => { if ($('[data-view-panel="traffic"]').classList.contains('active')) requestAnimationFrame(renderTraffic); });

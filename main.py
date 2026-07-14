@@ -192,6 +192,8 @@ class InstanceInfo:
     traffic_out: int = 0  # 出站流量 (bytes)
     traffic_limit: int = 0  # 流量限制 (bytes)
     traffic_check_url: str = ""  # 流量检查URL
+    total_uploaded_bytes: int = 0  # qBittorrent累计上传流量
+    total_downloaded_bytes: int = 0  # qBittorrent累计下载流量
     reserved_space: int = 0  # 需要保留的空闲空间 (bytes)
     last_update: datetime = field(default_factory=datetime.now)
     is_reconnecting: bool = False  # 是否正在重连中
@@ -507,12 +509,16 @@ class QBittorrentLoadBalancer:
                         'active_downloads': 0,
                         'upload_speed_kib': 0.0,
                         'download_speed_kib': 0.0,
+                        'uploaded_bytes': 0,
+                        'downloaded_bytes': 0,
                         'instances': [],
                     })
                     total['torrent_count'] += stats['torrent_count']
                     total['active_downloads'] += stats['active_downloads']
                     total['upload_speed_kib'] += stats['upload_speed_kib']
                     total['download_speed_kib'] += stats['download_speed_kib']
+                    total['uploaded_bytes'] += stats['uploaded_bytes']
+                    total['downloaded_bytes'] += stats['downloaded_bytes']
                     total['instances'].append(instance.name)
             tracker_stats = sorted(
                 tracker_totals.values(),
@@ -521,6 +527,10 @@ class QBittorrentLoadBalancer:
             for item in tracker_stats:
                 item['upload_speed_kib'] = round(item['upload_speed_kib'], 1)
                 item['download_speed_kib'] = round(item['download_speed_kib'], 1)
+            traffic_totals = {
+                'uploaded_bytes': sum(instance.total_uploaded_bytes for instance in self.instances),
+                'downloaded_bytes': sum(instance.total_downloaded_bytes for instance in self.instances),
+            }
         history_lock = getattr(self, 'metrics_history_lock', None)
         if history_lock:
             with history_lock:
@@ -559,6 +569,7 @@ class QBittorrentLoadBalancer:
             'telegram': telegram_status,
             'metrics_history': metrics_history,
             'tracker_stats': tracker_stats,
+            'traffic_totals': traffic_totals,
             'sort_key': self.config.get('primary_sort_key', DEFAULT_PRIMARY_SORT_KEY),
             'updated_at': datetime.now().isoformat(),
         }
@@ -874,6 +885,8 @@ class QBittorrentLoadBalancer:
         # 从server_state获取全局统计信息和硬盘空间
         instance.upload_speed = server_state.get('up_info_speed', 0) / BYTES_TO_KB
         instance.download_speed = server_state.get('dl_info_speed', 0) / BYTES_TO_KB
+        instance.total_uploaded_bytes = max(0, int(server_state.get('alltime_ul', 0) or 0))
+        instance.total_downloaded_bytes = max(0, int(server_state.get('alltime_dl', 0) or 0))
         instance.free_space = server_state.get('free_space_on_disk', 0)
         
         # 从torrents信息计算活跃下载数
@@ -913,12 +926,16 @@ class QBittorrentLoadBalancer:
                 'active_downloads': 0,
                 'upload_speed_kib': 0.0,
                 'download_speed_kib': 0.0,
+                'uploaded_bytes': 0,
+                'downloaded_bytes': 0,
             })
             stats['torrent_count'] += 1
             if getattr(torrent, 'state', '') == 'downloading':
                 stats['active_downloads'] += 1
             stats['upload_speed_kib'] += float(getattr(torrent, 'upspeed', 0) or 0) / BYTES_TO_KB
             stats['download_speed_kib'] += float(getattr(torrent, 'dlspeed', 0) or 0) / BYTES_TO_KB
+            stats['uploaded_bytes'] += max(0, int(getattr(torrent, 'uploaded', 0) or 0))
+            stats['downloaded_bytes'] += max(0, int(getattr(torrent, 'downloaded', 0) or 0))
         return trackers
 
 
