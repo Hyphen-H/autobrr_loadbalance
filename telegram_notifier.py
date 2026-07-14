@@ -55,17 +55,34 @@ class TelegramNotifier:
             pass
 
     def _run(self) -> None:
-        endpoint = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
         while True:
             message = self._messages.get()
             if message is None:
                 return
             try:
-                response = requests.post(
-                    endpoint,
-                    json={"chat_id": self.chat_id, "text": message},
-                    timeout=self.timeout,
-                )
-                response.raise_for_status()
+                self._deliver(message)
             except Exception as exc:
                 logger.error("发送Telegram通知失败：%s", exc)
+
+    def test(self, message: str) -> None:
+        """Send immediately so the dashboard can report Telegram API errors."""
+        if not self.enabled:
+            raise RuntimeError("Telegram通知未启用")
+        self._deliver(message)
+
+    def _deliver(self, message: str) -> None:
+        endpoint = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        response = requests.post(
+            endpoint,
+            json={"chat_id": self.chat_id, "text": message},
+            timeout=self.timeout,
+        )
+        try:
+            response.raise_for_status()
+        except Exception as exc:
+            detail = ''
+            try:
+                detail = response.json().get('description', '')
+            except Exception:
+                pass
+            raise RuntimeError(detail or str(exc)) from exc

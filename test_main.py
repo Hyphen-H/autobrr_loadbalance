@@ -199,6 +199,26 @@ class InstanceMetricsLoggingTest(unittest.TestCase):
         self.assertEqual(1, instance.active_downloads)
         self.assertEqual(3, instance.waiting_downloads_count)
 
+    def test_metrics_are_aggregated_by_tracker_host(self):
+        balancer = main.QBittorrentLoadBalancer.__new__(main.QBittorrentLoadBalancer)
+        instance = main.InstanceInfo(name="test", url="http://example.invalid", username="user", password="pass")
+        maindata = {
+            "server_state": {},
+            "torrents": {
+                "one": types.SimpleNamespace(state="downloading", tracker="https://tracker.example/announce", upspeed=1024, dlspeed=2048),
+                "two": types.SimpleNamespace(state="stalledUP", tracker="https://tracker.example/announce", upspeed=512, dlspeed=0),
+                "three": types.SimpleNamespace(state="pausedDL", tracker="", upspeed=0, dlspeed=0),
+            },
+        }
+
+        balancer._update_instance_metrics(instance, maindata)
+
+        self.assertEqual(2, instance.tracker_stats["tracker.example"]["torrent_count"])
+        self.assertEqual(1, instance.tracker_stats["tracker.example"]["active_downloads"])
+        self.assertEqual(1.5, instance.tracker_stats["tracker.example"]["upload_speed_kib"])
+        self.assertEqual(2.0, instance.tracker_stats["tracker.example"]["download_speed_kib"])
+        self.assertEqual(1, instance.tracker_stats["无 tracker"]["torrent_count"])
+
 
 class StatusUpdateTest(unittest.TestCase):
     class FakeClient:
@@ -226,6 +246,23 @@ class StatusUpdateTest(unittest.TestCase):
         balancer._update_single_instance(instance)
 
         self.assertEqual(1, instance.success_metrics_count)
+
+    def test_status_refresh_records_separate_upload_and_download_history(self):
+        balancer = main.QBittorrentLoadBalancer.__new__(main.QBittorrentLoadBalancer)
+        balancer.config = {}
+        balancer.instances_lock = threading.Lock()
+        balancer.metrics_history_lock = threading.Lock()
+        balancer.metrics_history = main.deque(maxlen=10)
+        balancer.instances = [main.InstanceInfo(
+            name="test", url="http://example.invalid", username="user", password="pass",
+            client=self.FakeClient(), is_connected=True,
+        )]
+
+        balancer._update_instance_status()
+
+        self.assertEqual(0.0, balancer.metrics_history[0]['upload_speed_kib'])
+        self.assertEqual(0.0, balancer.metrics_history[0]['download_speed_kib'])
+        self.assertIn('timestamp', balancer.metrics_history[0])
 
 
 class DashboardConfigurationTest(unittest.TestCase):
@@ -312,6 +349,39 @@ class DashboardConfigurationTest(unittest.TestCase):
             self.assertTrue(result['enabled'])
             self.assertEqual('saved-token', balancer.config['telegram']['bot_token'])
             self.assertEqual('new-chat', balancer.config['telegram']['chat_id'])
+
+    def test_clone_instance_preserves_secret_and_uses_unique_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_file = os.path.join(directory, 'config.json')
+            config = {'qbittorrent_instances': [{
+                'name': 'source', 'url': 'http://qb:8080', 'username': 'admin',
+                'password': 'secret', 'reserved_space': 0,
+            }]}
+            balancer = self._balancer(config, config_file)
+            balancer.instances = [main.InstanceInfo(name='source', url='http://qb:8080', username='admin', password='secret')]
+
+            with mock.patch.object(balancer, '_connect_instance', side_effect=lambda instance: setattr(instance, 'is_connected', True)):
+                first = balancer.clone_qbittorrent_instance('source')
+                second = balancer.clone_qbittorrent_instance('source')
+
+            self.assertEqual('source-copy', first['name'])
+            self.assertEqual('source-copy-2', second['name'])
+            self.assertEqual('secret', balancer.config['qbittorrent_instances'][1]['password'])
+            self.assertEqual(3, len(balancer.instances))
+
+
+class DashboardLogHandlerTest(unittest.TestCase):
+    def test_incremental_reads_return_only_records_after_cursor(self):
+        handler = main.DashboardLogHandler(capacity=100)
+        handler.emit(main.logging.LogRecord('test', main.logging.INFO, __file__, 1, 'first', (), None))
+        first = handler.read_after()
+        handler.emit(main.logging.LogRecord('test', main.logging.ERROR, __file__, 2, 'second', (), None))
+
+        second = handler.read_after(first['cursor'])
+
+        self.assertEqual(['first'], [record['message'] for record in first['logs']])
+        self.assertEqual(['second'], [record['message'] for record in second['logs']])
+        self.assertEqual('ERROR', second['logs'][0]['level'])
 
 
 if __name__ == "__main__":

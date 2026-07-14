@@ -189,6 +189,20 @@ class WebhookServer:
             self.record_event('config', 'qBittorrent instance', f'删除 {name}', request.remote_addr or '')
             return jsonify({'status': 'deleted'})
 
+        @self.app.route('/api/dashboard/instances/clone', methods=['POST'])
+        @self._dashboard_auth_required
+        def clone_instance():
+            payload = request.get_json(silent=True) or {}
+            try:
+                result = self.torrent_manager.clone_qbittorrent_instance(str(payload.get('name', '')).strip())
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except OSError as exc:
+                logger.error("克隆qBittorrent实例失败：%s", exc)
+                return jsonify({'error': 'Failed to persist configuration'}), 500
+            self.record_event('config', 'qBittorrent instance', f"克隆 {result['name']}", request.remote_addr or '')
+            return jsonify(result), 201
+
         @self.app.route('/api/dashboard/config/import', methods=['POST'])
         @self._dashboard_auth_required
         def import_config():
@@ -224,9 +238,22 @@ class WebhookServer:
         @self.app.route('/api/dashboard/telegram/test', methods=['POST'])
         @self._dashboard_auth_required
         def test_telegram_config():
-            if not self.torrent_manager.send_telegram_test():
-                return jsonify({'error': 'Telegram is disabled or the notification queue is full'}), 409
-            return jsonify({'status': 'queued'})
+            try:
+                self.torrent_manager.send_telegram_test()
+            except Exception as exc:
+                logger.error("Telegram测试通知失败：%s", exc)
+                return jsonify({'error': str(exc)}), 502
+            return jsonify({'status': 'sent'})
+
+        @self.app.route('/api/dashboard/logs', methods=['GET'])
+        @self._dashboard_auth_required
+        def dashboard_logs():
+            try:
+                after = max(0, int(request.args.get('after', 0)))
+                limit = max(1, min(int(request.args.get('limit', 500)), 1000))
+            except ValueError:
+                return jsonify({'error': 'Invalid log cursor or limit'}), 400
+            return jsonify(self.torrent_manager.get_dashboard_logs(after, limit))
 
     def record_event(self, status: str, release_name: str, detail: str = '', source_ip: str = '') -> None:
         event = {

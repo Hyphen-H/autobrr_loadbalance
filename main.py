@@ -12,9 +12,11 @@ import time
 import threading
 import logging
 import requests
+from collections import deque
 from datetime import datetime
 from typing import List, Dict, Optional
 from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
 import qbittorrentapi
 from webhook_server import WebhookServer
@@ -57,6 +59,40 @@ UPLOAD_DOWNLOAD_SORT_DOWNLOAD_WEIGHT = 0.4
 
 # 创建一个简单的logger，避免在初始化之前输出日志
 logger = logging.getLogger(__name__)
+
+
+class DashboardLogHandler(logging.Handler):
+    """Thread-safe bounded log buffer for incremental dashboard reads."""
+
+    def __init__(self, capacity: int = 1000):
+        super().__init__(logging.DEBUG)
+        self.records = deque(maxlen=max(100, min(capacity, 5000)))
+        self.records_lock = threading.Lock()
+        self.sequence = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+            if record.exc_info:
+                formatter = self.formatter or logging.Formatter()
+                message = f"{message}\n{formatter.formatException(record.exc_info)}"
+            with self.records_lock:
+                self.sequence += 1
+                self.records.append({
+                    'id': self.sequence,
+                    'timestamp': datetime.fromtimestamp(record.created).isoformat(),
+                    'level': record.levelname,
+                    'logger': record.name,
+                    'message': message,
+                })
+        except Exception:
+            self.handleError(record)
+
+    def read_after(self, after: int = 0, limit: int = 500) -> dict:
+        limit = max(1, min(limit, 1000))
+        with self.records_lock:
+            matching = [item for item in self.records if item['id'] > after]
+            return {'logs': matching[-limit:], 'cursor': self.sequence}
 
 def setup_logging(log_dir=None):
     """设置日志配置，同时输出到控制台和文件"""
@@ -159,6 +195,7 @@ class InstanceInfo:
     reserved_space: int = 0  # 需要保留的空闲空间 (bytes)
     last_update: datetime = field(default_factory=datetime.now)
     is_reconnecting: bool = False  # 是否正在重连中
+    tracker_stats: Dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -182,6 +219,9 @@ class QBittorrentLoadBalancer:
         self.instances_lock = threading.Lock()
         self.status_refresh_event = threading.Event()
         self.config_lock = threading.Lock()
+        history_points = int(self.config.get('dashboard', {}).get('history_points', 120))
+        self.metrics_history = deque(maxlen=max(10, min(history_points, 600)))
+        self.metrics_history_lock = threading.Lock()
         
         # 重新配置日志（支持文件输出）
         self._setup_logging()
@@ -206,6 +246,10 @@ class QBittorrentLoadBalancer:
                 log_dir = './logs'
         
         logger = setup_logging(log_dir)
+        log_capacity = int(self.config.get('dashboard', {}).get('log_limit', 1000))
+        self.dashboard_log_handler = DashboardLogHandler(log_capacity)
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger().addHandler(self.dashboard_log_handler)
         
     def _setup_environment(self) -> None:
         """设置运行环境"""
@@ -268,11 +312,11 @@ class QBittorrentLoadBalancer:
         
         # 安全地转换保留空间值（从MB转换为字节）
         try:
-            reserved_space_mb = config.get('reserved_space', 21 * 1024)  # 默认21GB
+            reserved_space_mb = config.get('reserved_space', 0)
             reserved_space_bytes = int(float(reserved_space_mb) * 1024 * 1024)  # MB转字节
         except (ValueError, TypeError) as e:
-            logger.warning(f"实例 {config.get('name', 'Unknown')} 保留空间值转换失败：{e}，设置为默认值21GB")
-            reserved_space_bytes = 21 * BYTES_TO_GB
+            logger.warning(f"实例 {config.get('name', 'Unknown')} 保留空间值转换失败：{e}，设置为0")
+            reserved_space_bytes = 0
             
         return InstanceInfo(
             name=config['name'],
@@ -454,6 +498,35 @@ class QBittorrentLoadBalancer:
                 }
                 for instance in self.instances
             ]
+            tracker_totals = {}
+            for instance in self.instances:
+                for tracker, stats in instance.tracker_stats.items():
+                    total = tracker_totals.setdefault(tracker, {
+                        'tracker': tracker,
+                        'torrent_count': 0,
+                        'active_downloads': 0,
+                        'upload_speed_kib': 0.0,
+                        'download_speed_kib': 0.0,
+                        'instances': [],
+                    })
+                    total['torrent_count'] += stats['torrent_count']
+                    total['active_downloads'] += stats['active_downloads']
+                    total['upload_speed_kib'] += stats['upload_speed_kib']
+                    total['download_speed_kib'] += stats['download_speed_kib']
+                    total['instances'].append(instance.name)
+            tracker_stats = sorted(
+                tracker_totals.values(),
+                key=lambda item: (-item['torrent_count'], item['tracker']),
+            )
+            for item in tracker_stats:
+                item['upload_speed_kib'] = round(item['upload_speed_kib'], 1)
+                item['download_speed_kib'] = round(item['download_speed_kib'], 1)
+        history_lock = getattr(self, 'metrics_history_lock', None)
+        if history_lock:
+            with history_lock:
+                metrics_history = list(self.metrics_history)
+        else:
+            metrics_history = []
         with self.pending_torrents_lock:
             pending_count = len(self.pending_torrents)
         with self.config_lock:
@@ -474,7 +547,7 @@ class QBittorrentLoadBalancer:
                     'has_password': bool(item.get('password')),
                     'traffic_check_url': item.get('traffic_check_url', ''),
                     'traffic_limit': item.get('traffic_limit', 0),
-                    'reserved_space': item.get('reserved_space', 21 * 1024),
+                    'reserved_space': item.get('reserved_space', 0),
                 }
                 for item in self.config.get('qbittorrent_instances', [])
             ]
@@ -484,6 +557,8 @@ class QBittorrentLoadBalancer:
             'pending_count': pending_count,
             'whitelist': whitelist,
             'telegram': telegram_status,
+            'metrics_history': metrics_history,
+            'tracker_stats': tracker_stats,
             'sort_key': self.config.get('primary_sort_key', DEFAULT_PRIMARY_SORT_KEY),
             'updated_at': datetime.now().isoformat(),
         }
@@ -581,7 +656,7 @@ class QBittorrentLoadBalancer:
                 'password': password,
                 'traffic_check_url': str(payload.get('traffic_check_url', '')).strip(),
                 'traffic_limit': self._non_negative_number(payload.get('traffic_limit', 0), 'traffic_limit'),
-                'reserved_space': self._non_negative_number(payload.get('reserved_space', 21 * 1024), 'reserved_space'),
+                'reserved_space': self._non_negative_number(payload.get('reserved_space', 0), 'reserved_space'),
             }
             new_instance = self._create_instance_from_config(instance_config)
             self._connect_instance(new_instance)
@@ -615,6 +690,34 @@ class QBittorrentLoadBalancer:
         with self.instances_lock:
             self.instances[:] = [item for item in self.instances if item.name != name]
         return True
+
+    def clone_qbittorrent_instance(self, name: str) -> dict:
+        """Clone an instance without exposing its password to the dashboard."""
+        with self.config_lock:
+            candidate = json.loads(json.dumps(self.config))
+            configs = candidate.setdefault('qbittorrent_instances', [])
+            source = next((item for item in configs if item.get('name') == name), None)
+            if source is None:
+                raise ValueError('instance not found')
+            existing_names = {item.get('name') for item in configs}
+            clone_name = f'{name}-copy'
+            suffix = 2
+            while clone_name in existing_names:
+                clone_name = f'{name}-copy-{suffix}'
+                suffix += 1
+            clone_config = json.loads(json.dumps(source))
+            clone_config['name'] = clone_name
+            clone_instance = self._create_instance_from_config(clone_config)
+            self._connect_instance(clone_instance)
+            configs.append(clone_config)
+            self._replace_config_locked(candidate)
+        with self.instances_lock:
+            self.instances.append(clone_instance)
+        return {'name': clone_name, 'connected': clone_instance.is_connected}
+
+    def get_dashboard_logs(self, after: int = 0, limit: int = 500) -> dict:
+        handler = getattr(self, 'dashboard_log_handler', None)
+        return handler.read_after(after, limit) if handler else {'logs': [], 'cursor': 0}
 
     def import_config(self, imported: dict) -> dict:
         """Import old or current config and hot-apply qBittorrent instances."""
@@ -665,7 +768,8 @@ class QBittorrentLoadBalancer:
 
     def update_telegram_config(self, payload: dict) -> dict:
         """Persist Telegram settings and replace the notifier immediately."""
-        enabled = bool(payload.get('enabled', False))
+        raw_enabled = payload.get('enabled', False)
+        enabled = raw_enabled is True or str(raw_enabled).lower() in {'1', 'true', 'yes', 'on'}
         try:
             timeout = float(payload.get('timeout', 10))
         except (TypeError, ValueError):
@@ -701,9 +805,12 @@ class QBittorrentLoadBalancer:
 
     def send_telegram_test(self) -> bool:
         notifier = getattr(self, 'telegram_notifier', None)
-        return bool(notifier and notifier.send(
+        if not notifier:
+            raise RuntimeError('Telegram通知器未初始化')
+        notifier.test(
             f"[测试通知] qBittorrent Load Balancer\n时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        ))
+        )
+        return True
 
     @staticmethod
     def _non_negative_number(value, field_name: str):
@@ -723,6 +830,17 @@ class QBittorrentLoadBalancer:
             for instance in self.instances:
                 if instance.is_connected:
                     self._update_single_instance(instance)
+            upload_speed = sum(instance.upload_speed for instance in self.instances if instance.is_connected)
+            download_speed = sum(instance.download_speed for instance in self.instances if instance.is_connected)
+        history = getattr(self, 'metrics_history', None)
+        history_lock = getattr(self, 'metrics_history_lock', None)
+        if history is not None and history_lock:
+            with history_lock:
+                history.append({
+                    'timestamp': datetime.now().isoformat(),
+                    'upload_speed_kib': round(upload_speed, 1),
+                    'download_speed_kib': round(download_speed, 1),
+                })
                     
     def _update_single_instance(self, instance: InstanceInfo) -> None:
         """更新单个实例的状态信息"""
@@ -759,11 +877,12 @@ class QBittorrentLoadBalancer:
         instance.free_space = server_state.get('free_space_on_disk', 0)
         
         # 从torrents信息计算活跃下载数
-        all_torrents = maindata.get('torrents', {}).values()
+        all_torrents = list(maindata.get('torrents', {}).values())
         instance.active_downloads = len([t for t in all_torrents if t.state == 'downloading'])
         instance.waiting_downloads_count = len([
             t for t in all_torrents if t.state in WAITING_DOWNLOAD_STATES
         ])
+        instance.tracker_stats = self._aggregate_tracker_stats(all_torrents)
         
         instance.last_update = datetime.now()
         instance.success_metrics_count += 1  # 成功获取统计信息，计数器加1
@@ -780,6 +899,27 @@ class QBittorrentLoadBalancer:
                    f"空间={instance.free_space/BYTES_TO_GB:.1f}/{instance.reserved_space/BYTES_TO_GB:.1f}GB，"
                    f"更新={instance.success_metrics_count}，"
                    f"历史任务={instance.total_added_tasks_count}")
+
+    @staticmethod
+    def _aggregate_tracker_stats(torrents) -> Dict[str, dict]:
+        """Aggregate live torrent counts and speeds by current tracker host."""
+        trackers = {}
+        for torrent in torrents:
+            tracker_url = str(getattr(torrent, 'tracker', '') or '').strip()
+            tracker = urlparse(tracker_url).hostname if tracker_url else None
+            tracker = (tracker or tracker_url or '无 Tracker').lower()
+            stats = trackers.setdefault(tracker, {
+                'torrent_count': 0,
+                'active_downloads': 0,
+                'upload_speed_kib': 0.0,
+                'download_speed_kib': 0.0,
+            })
+            stats['torrent_count'] += 1
+            if getattr(torrent, 'state', '') == 'downloading':
+                stats['active_downloads'] += 1
+            stats['upload_speed_kib'] += float(getattr(torrent, 'upspeed', 0) or 0) / BYTES_TO_KB
+            stats['download_speed_kib'] += float(getattr(torrent, 'dlspeed', 0) or 0) / BYTES_TO_KB
+        return trackers
 
 
     def _check_instance_traffic(self, instance: InstanceInfo) -> None:

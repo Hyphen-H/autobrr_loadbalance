@@ -10,6 +10,9 @@
 - **流量监控**: 支持流量限制检查（可选）
 - **Telegram 通知**: 推送种子分配结果、无可用实例和实例离线/恢复事件
 - **运维 Dashboard**: 查看实例速度、任务和剩余空间，管理实例与 Webhook IP 白名单
+- **运行统计**: 分别展示上传/下载吞吐历史，并按当前 tracker 聚合种子和速度
+- **实时日志**: 支持级别、顺序、自动跟随、换行缩进和单行显示控制
+- **实例管理**: 支持打开 Web UI、IP 快捷修改、克隆、完整编辑和表格列排序
 - **配置导入**: 从 Dashboard 导入新旧版本 `config.json` 并热更新 qBittorrent 实例
 
 ## 快速开始
@@ -111,7 +114,7 @@ python run.py
 |------|------|
 | `traffic_check_url` | 流量检查 API URL |
 | `traffic_limit` | 流量限制（MB），超限实例会被跳过 |
-| `reserved_space` | 需要保留的空闲空间（MB），低于此值的实例会被跳过 |
+| `reserved_space` | 需要保留的空闲空间（MB），默认 `0`，低于此值的实例会被跳过 |
 
 流量限制参数traffic_check_url和traffic_limit支持两种应用场景：
 1. 配套`https://github.com/guowanghushifu/netcup-traffic-tester`使用，traffic_limit填2000000
@@ -126,14 +129,19 @@ python run.py
     "enabled": true,
     "username": "admin",
     "password": "change-this-password",
-    "event_limit": 100
+    "event_limit": 100,
+    "history_points": 120,
+    "log_limit": 1000
 }
 ```
 
 启动后访问 `http://<服务器IP>:50000/dashboard`，浏览器会要求输入上述用户名和密码。Dashboard 支持：
 
 - 查看各实例连接状态、实时上传/下载速度、任务数、剩余空间、保留空间和流量
-- 添加、编辑、删除 qBittorrent 实例；保存后立即连接，无需重启
+- 打开、克隆、编辑、删除 qBittorrent 实例，或仅快捷修改 IP；保存后立即连接
+- 拖动实例表列头调整顺序，点击列头切换升序/降序
+- 分别查看上传/下载吞吐图与按 tracker 聚合的实时统计
+- 按级别实时查看日志，并控制顺序、自动跟随、换行缩进和单行显示
 - 添加或移除 Webhook IPv4、IPv6、CIDR 白名单
 - 配置、启停 Telegram Bot，并发送测试通知；Token 留空可保留已保存值
 - 导入 `config.json`；旧配置缺少 Dashboard、Telegram、白名单字段时会保留当前管理配置并自动补默认值
@@ -156,6 +164,8 @@ python run.py
 ```
 
 Telegram 消息由后台队列发送，不会阻塞 Webhook 请求。
+
+Dashboard 中的“发送测试通知”会同步请求 Telegram API，并直接返回无效 Token、Chat ID 或网络错误。Bot Token 可通过 [BotFather](https://t.me/BotFather) 获取，Chat ID 可通过 [userinfobot](https://t.me/userinfobot) 查询。
 
 ## 配置示例
 请参考config.json.example
@@ -193,6 +203,7 @@ git pull origin main
 - `POST <webhook_path>`: 接收 autobrr 种子添加请求
 - `GET /dashboard`: Dashboard（HTTP Basic 认证）
 - `/api/dashboard/*`: Dashboard 管理 API（HTTP Basic 认证）
+- `GET /api/dashboard/logs`: Dashboard 增量日志（HTTP Basic 认证）
 
 ## 日志
 
@@ -205,3 +216,9 @@ git pull origin main
 1. **连接失败**: 检查 qBittorrent Web UI 设置和网络连通性
 2. **Webhook 无响应**: 确认 `webhook_path` 配置正确
 3. **调试模式**: 设置 `debug_add_stopped: true` 暂停新种子便于调试 
+
+## 前端资源
+
+- Dashboard 字体使用 [LXGW Bright GB](https://github.com/lxgw/LxgwBright)，按 SIL Open Font License 1.1 随仓库分发。
+- 界面图标使用 Iconbolt 的 [Solar Outline](https://www.iconbolt.com/iconsets/solar-outline) 图标集，设计者为 480 Design，MIT License。
+- favicon 基于 [autobrr](https://github.com/autobrr/autobrr) 官方标志修改为绿色。

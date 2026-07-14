@@ -74,6 +74,17 @@ prepare_permissions() {
         -c 'chown appuser:appuser /app/config.json && chown -R appuser:appuser /app/logs'
 }
 
+get_server_ip() {
+    local address
+    for address in $(hostname -I 2>/dev/null); do
+        case "$address" in
+            127.*|*:* ) continue ;;
+            * ) echo "$address"; return ;;
+        esac
+    done
+    echo "127.0.0.1"
+}
+
 # 显示使用帮助
 show_help() {
     echo "用法: $0 [选项]"
@@ -100,8 +111,10 @@ case "${1:-start}" in
         prepare_permissions
         print_message "启动负载均衡器..." $GREEN
         docker compose up -d
+        server_ip=$(get_server_ip)
         print_message "服务已启动！" $GREEN
-        print_message "Dashboard: http://<服务器IP>:50000/dashboard" $BLUE
+        print_message "服务地址: http://${server_ip}:50000" $BLUE
+        print_message "Dashboard: http://${server_ip}:50000/dashboard" $BLUE
         print_message "健康检查: curl http://127.0.0.1:50000/health" $BLUE
         print_message "查看日志: ./docker-start.sh logs" $BLUE
         ;;
